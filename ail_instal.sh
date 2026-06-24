@@ -311,15 +311,23 @@ setup_ail_repo() {
         else
             ok "AIL repository is up to date"
         fi
-        git submodule update --init --recursive --quiet
     else
         log "Cloning AIL framework to $AIL_DIR..."
         mkdir -p "$(dirname "$AIL_DIR")"
-        git clone --depth 1 https://github.com/ail-project/ail-framework.git "$AIL_DIR"
+        # Clone with full depth so submodule history is available
+        git clone https://github.com/ail-project/ail-framework.git "$AIL_DIR"
         cd "$AIL_DIR"
-        git submodule update --init --recursive --quiet
         ok "AIL framework cloned"
     fi
+
+    # Always fully initialise submodules — tlsh, faup, etc. are C extensions
+    # that must be present before install_virtualenv.sh runs or it will abort
+    # with "pushd: tlsh/py_ext: No such file or directory"
+    cd "$AIL_DIR"
+    log "Initialising git submodules (tlsh, faup, etc.)..."
+    git submodule sync --recursive
+    git submodule update --init --recursive
+    ok "Submodules initialised"
 
     # Fix ownership
     chown -R "$AIL_USER":"$AIL_USER" "$AIL_DIR" 2>/dev/null || true
@@ -372,10 +380,14 @@ setup_venv() {
     if [[ -f "$AIL_DIR/requirements.txt" ]]; then
 
         # ── Pre-install packages that are GitHub-only or unavailable on PyPI ──
-        # pybgpranking is not on PyPI — must be installed directly from source.
-        # bgpranking-redis-api is its dependency, also GitHub-only.
+        # pybgpranking is not on PyPI. Try two known install paths; if both fail
+        # we skip it — AIL core functionality works without BGP ranking.
         log "Pre-installing GitHub-only dependencies..."
-        "$VENV_DIR/bin/pip" install -q             "git+https://github.com/D4-project/BGP-Ranking.git#egg=pybgpranking&subdirectory=client"             2>/dev/null || warn "pybgpranking GitHub install failed — will skip in requirements.txt"
+        if ! "$VENV_DIR/bin/pip" install -q             "git+https://github.com/D4-project/BGP-Ranking.git@main#subdirectory=client"             2>/dev/null; then
+            if ! "$VENV_DIR/bin/pip" install -q pybgpranking 2>/dev/null; then
+                warn "pybgpranking not installable — BGP ranking feature will be unavailable (non-critical)"
+            fi
+        fi
 
         # ── Build a filtered requirements file skipping known broken packages ──
         # Some packages require Python <3.11 (e.g. old numpy), are unavailable
@@ -404,10 +416,21 @@ setup_venv() {
         ok "AIL Python requirements installed (with skips where needed)"
     fi
 
-    # Run official virtualenv installer if present
+    # Run official virtualenv installer — builds tlsh, faup C extensions.
+    # Run with set +e so errors in individual build steps do not abort
+    # the whole script; we check the result and warn rather than exit.
     if [[ -f "$AIL_DIR/install_virtualenv.sh" ]]; then
-        log "Running official virtualenv installer..."
-        bash "$AIL_DIR/install_virtualenv.sh" 2>&1 | tail -5
+        log "Running official virtualenv installer (building C extensions)..."
+        set +e
+        bash "$AIL_DIR/install_virtualenv.sh" 2>&1 | tee /var/log/ail_virtualenv.log | tail -10
+        VENV_SH_EXIT=${PIPESTATUS[0]}
+        set -e
+        if [[ "$VENV_SH_EXIT" -eq 0 ]]; then
+            ok "Official virtualenv installer completed"
+        else
+            warn "install_virtualenv.sh exited with code $VENV_SH_EXIT — see /var/log/ail_virtualenv.log"
+            warn "Continuing anyway — some optional C extensions may be missing"
+        fi
     fi
 
     deactivate
