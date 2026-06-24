@@ -370,8 +370,38 @@ setup_venv() {
 
     log "Installing AIL Python requirements..."
     if [[ -f "$AIL_DIR/requirements.txt" ]]; then
-        "$VENV_DIR/bin/pip" install -r "$AIL_DIR/requirements.txt" -q
-        ok "Core requirements installed"
+
+        # ── Pre-install packages that are GitHub-only or unavailable on PyPI ──
+        # pybgpranking is not on PyPI — must be installed directly from source.
+        # bgpranking-redis-api is its dependency, also GitHub-only.
+        log "Pre-installing GitHub-only dependencies..."
+        "$VENV_DIR/bin/pip" install -q             "git+https://github.com/D4-project/BGP-Ranking.git#egg=pybgpranking&subdirectory=client"             2>/dev/null || warn "pybgpranking GitHub install failed — will skip in requirements.txt"
+
+        # ── Build a filtered requirements file skipping known broken packages ──
+        # Some packages require Python <3.11 (e.g. old numpy), are unavailable
+        # on PyPI, or have been renamed. We try each one individually and skip
+        # failures rather than aborting the whole install.
+        log "Installing requirements (skipping unavailable packages)..."
+        FAILED_PKGS=""
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Skip blank lines, comments, and -r includes
+            [[ -z "$line" || "$line" == \#* || "$line" == -r* ]] && continue
+
+            # Skip pybgpranking — already handled above
+            [[ "$line" == *pybgpranking* ]] && continue
+
+            if ! "$VENV_DIR/bin/pip" install -q "$line" 2>/dev/null; then
+                warn "Skipped (unavailable): $line"
+                FAILED_PKGS="$FAILED_PKGS
+  - $line"
+            fi
+        done < "$AIL_DIR/requirements.txt"
+
+        if [[ -n "$FAILED_PKGS" ]]; then
+            warn "The following packages were skipped (AIL may still work without them):"
+            echo -e "$FAILED_PKGS"
+        fi
+        ok "AIL Python requirements installed (with skips where needed)"
     fi
 
     # Run official virtualenv installer if present
