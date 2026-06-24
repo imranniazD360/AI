@@ -122,54 +122,85 @@ diagnose_system() {
 
 # =============================================================================
 # SECTION 2 — PORT CONFLICT RESOLUTION
+# Kill anything on every required port before proceeding.
+# We never reassign ports — AIL, Redis, and KVRocks must be on their
+# configured ports. If something refuses to die, we abort with a clear error.
 # =============================================================================
-resolve_port() {
+
+# kill_port SERVICE PORT
+# Forcefully frees a port. Tries: systemctl stop → SIGTERM → SIGKILL → fuser.
+# Errors out if the port is still occupied after all attempts.
+kill_port() {
     local SERVICE="$1"
     local PORT="$2"
-    local VARNAME="$3"
 
-    if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
-        local OCCUPANT
-        OCCUPANT=$(ss -tlnp 2>/dev/null | grep ":${PORT} " | awk '{print $NF}' | head -1 || echo "unknown")
-        warn "Port $PORT is in use by: $OCCUPANT"
-
-        # Try to gracefully stop known services
-        if echo "$OCCUPANT" | grep -qi redis; then
-            log "Attempting to stop conflicting Redis on port $PORT..."
-            systemctl stop redis redis-server 2>/dev/null || true
-            pkill -f "redis-server.*:${PORT}" 2>/dev/null || true
-            sleep 2
-        elif echo "$OCCUPANT" | grep -qi meilisearch; then
-            pkill -f meilisearch 2>/dev/null || true
-            sleep 2
-        fi
-
-        # Recheck
-        if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
-            # Find next free port
-            local NEW_PORT=$((PORT + 1))
-            while ss -tlnp 2>/dev/null | grep -q ":${NEW_PORT} "; do
-                NEW_PORT=$((NEW_PORT + 1))
-            done
-            warn "$SERVICE: port $PORT still busy → reassigning to $NEW_PORT"
-            eval "$VARNAME=$NEW_PORT"
-        else
-            ok "$SERVICE: port $PORT is now free"
-        fi
-    else
+    # Already free — nothing to do
+    if ! ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
         ok "Port $PORT is free for $SERVICE"
+        return 0
     fi
+
+    warn "Port $PORT is in use — clearing for $SERVICE"
+
+    # Identify what is holding the port
+    local OCCUPANT
+    OCCUPANT=$(ss -tlnp 2>/dev/null | grep ":${PORT} " | awk '{print $NF}' | head -1 || echo "unknown")
+    log "  Occupant: $OCCUPANT"
+
+    # ── Step 1: stop known systemd services gracefully ──────────────────────
+    for SVC in redis redis-server redis-$PORT meilisearch lacus libretranslate ail; do
+        systemctl stop "$SVC" 2>/dev/null || true
+    done
+    sleep 1
+
+    # ── Step 2: SIGTERM any process still on this port ──────────────────────
+    local PIDS
+    PIDS=$(ss -tlnp 2>/dev/null | grep ":${PORT} "         | grep -oP "pid=\K[0-9]+" || true)
+    if [[ -n "$PIDS" ]]; then
+        log "  Sending SIGTERM to PIDs: $PIDS"
+        kill $PIDS 2>/dev/null || true
+        sleep 2
+    fi
+
+    # ── Step 3: SIGKILL anything that survived ───────────────────────────────
+    PIDS=$(ss -tlnp 2>/dev/null | grep ":${PORT} "         | grep -oP "pid=\K[0-9]+" || true)
+    if [[ -n "$PIDS" ]]; then
+        log "  Sending SIGKILL to PIDs: $PIDS"
+        kill -9 $PIDS 2>/dev/null || true
+        sleep 2
+    fi
+
+    # ── Step 4: fuser as last resort ────────────────────────────────────────
+    if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+        log "  Trying fuser -k $PORT/tcp ..."
+        fuser -k "${PORT}/tcp" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # ── Final check ─────────────────────────────────────────────────────────
+    if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+        err "Port $PORT is STILL occupied after all kill attempts."
+        err "Run:  sudo fuser -k ${PORT}/tcp   then re-run this script."
+        exit 1
+    fi
+
+    ok "Port $PORT cleared for $SERVICE"
 }
 
 check_all_ports() {
-    sep; log "SECTION 2 — Port Conflict Resolution"
-    resolve_port "AIL Web"         "$AIL_PORT"              "AIL_PORT"
-    resolve_port "Redis"           "$REDIS_PORT"            "REDIS_PORT"
-    resolve_port "ARDB/KVRocks"   "$ARDB_PORT"             "ARDB_PORT"
-    resolve_port "Lacus Crawler"   "$LACUS_PORT"            "LACUS_PORT"
-    resolve_port "Meilisearch"     "$MEILI_PORT"            "MEILI_PORT"
-    resolve_port "LibreTranslate"  "$LIBRETRANSLATE_PORT"   "LIBRETRANSLATE_PORT"
-    log "Final ports → AIL:$AIL_PORT | Redis:$REDIS_PORT | ARDB:$ARDB_PORT | Lacus:$LACUS_PORT | Meili:$MEILI_PORT | LibreTranslate:$LIBRETRANSLATE_PORT"
+    sep; log "SECTION 2 — Port Conflict Resolution (kill & clear all)"
+
+    # Install fuser if missing (needed for last-resort kill)
+    command -v fuser &>/dev/null || apt-get install -y -q psmisc 2>/dev/null || true
+
+    kill_port "AIL Web"         "$AIL_PORT"
+    kill_port "Redis"           "$REDIS_PORT"
+    kill_port "ARDB/KVRocks"    "$ARDB_PORT"
+    kill_port "Lacus Crawler"   "$LACUS_PORT"
+    kill_port "Meilisearch"     "$MEILI_PORT"
+    kill_port "LibreTranslate"  "$LIBRETRANSLATE_PORT"
+
+    log "All ports clear → AIL:$AIL_PORT | Redis:$REDIS_PORT | ARDB:$ARDB_PORT | Lacus:$LACUS_PORT | Meili:$MEILI_PORT | LibreTranslate:$LIBRETRANSLATE_PORT"
 }
 
 # =============================================================================
@@ -177,6 +208,11 @@ check_all_ports() {
 # =============================================================================
 install_system_deps() {
     sep; log "SECTION 3 — Installing System Dependencies"
+
+    # Temporarily suspend exit-on-error for apt/pip which emit non-fatal
+    # warnings (charset_normalizer metadata, Debian keyring deprecation) that
+    # would otherwise abort the script under set -euo pipefail.
+    set +e
 
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -203,15 +239,19 @@ install_system_deps() {
     PYVER=$($PYTHON_BIN --version | awk '{print $2}')
     ok "Python: $PYVER at $PYTHON_BIN"
 
-    # [FIX-9] Kali 2024+ / Debian 12+ enforce PEP 668 — system pip is blocked
-    #         unless --break-system-packages is passed. Detect and apply flag.
-    #         All real package installs happen inside venvs; this just primes pip.
-    PIP_SYS_FLAGS=""
-    if ! $PYTHON_BIN -m pip install --upgrade --dry-run pip &>/dev/null 2>&1; then
-        PIP_SYS_FLAGS="--break-system-packages"
-        warn "PEP 668 (externally-managed-environment) detected — adding --break-system-packages"
+    # [FIX-9] PEP 668 (Kali/Debian/Ubuntu 24+) blocks system pip.
+    #         We detect it and skip the system pip upgrade entirely —
+    #         all real pip work happens inside venvs where it is always safe.
+    #         Trying to upgrade pip/wheel/setuptools system-wide causes:
+    #         "Cannot uninstall wheel, RECORD file not found" and aborts the script.
+    if $PYTHON_BIN -m pip install --dry-run --upgrade pip &>/dev/null 2>&1; then
+        $PYTHON_BIN -m pip install --upgrade pip -q 2>/dev/null || true
+        ok "System pip upgraded"
+    else
+        warn "PEP 668 externally-managed env detected — skipping system pip upgrade (venvs handle their own pip)"
     fi
-    $PYTHON_BIN -m pip install --upgrade pip setuptools wheel -q $PIP_SYS_FLAGS || true
+    ok "System pip check complete"
+    set -e   # re-enable exit-on-error
 }
 
 # =============================================================================
@@ -325,6 +365,7 @@ setup_venv() {
 
     # Activate and install requirements
     source "$VENV_DIR/bin/activate"
+    # setuptools/wheel are safe to upgrade inside a venv (no Debian RECORD conflict)
     "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel -q
 
     log "Installing AIL Python requirements..."
@@ -349,37 +390,32 @@ setup_venv() {
 setup_kvrocks() {
     sep; log "SECTION 7 — KVRocks (ARDB replacement)"
 
-    KVROCKS_DIR="/opt/kvrocks"
-    KVROCKS_BIN="$KVROCKS_DIR/bin/kvrocks"
+    # AIL bundles KVRocks inside its own env/ directory and compiles it via
+    # installing_deps.sh (Section 13). We only install build deps here so that
+    # AIL's own script succeeds. We do NOT compile KVRocks ourselves — doing so
+    # takes 20-40 min, often fails on RAM-limited boxes, and puts the binary in
+    # the wrong location for AIL anyway.
 
-    # AIL ships with its own internal databases — check if it already has kvrocks
-    if [[ -f "$AIL_DIR/env/kvrocks/bin/kvrocks" ]]; then
-        ok "KVRocks found in AIL env directory"
+    KVROCKS_AIL_BIN="$AIL_DIR/env/kvrocks/bin/kvrocks"
+    KVROCKS_SYS_BIN="/opt/kvrocks/bin/kvrocks"
+
+    if [[ -f "$KVROCKS_AIL_BIN" ]]; then
+        KVROCKS_VER=$("$KVROCKS_AIL_BIN" --version 2>/dev/null | head -1 || echo "unknown")
+        ok "KVRocks already present in AIL env: $KVROCKS_VER"
         return
     fi
 
-    if [[ -f "$KVROCKS_BIN" ]]; then
-        KVROCKS_VER=$("$KVROCKS_BIN" --version 2>/dev/null | head -1 || echo "unknown")
-        ok "KVRocks already installed: $KVROCKS_VER"
+    if [[ -f "$KVROCKS_SYS_BIN" ]]; then
+        ok "KVRocks already present at $KVROCKS_SYS_BIN"
         return
     fi
 
-    log "Installing KVRocks (Redis-compatible persistent store)..."
+    log "Installing KVRocks build dependencies (AIL installer will compile it in Section 13)..."
     apt-get install -y --no-install-recommends \
-        cmake g++ autoconf automake libtool git \
-        libsnappy-dev libgflags-dev libzstd-dev libbz2-dev liblz4-dev 2>/dev/null || true
-
-    mkdir -p "$KVROCKS_DIR"
-    TMP=$(mktemp -d)
-    cd "$TMP"
-    git clone --depth 1 https://github.com/apache/kvrocks.git 2>/dev/null
-    cd kvrocks
-    ./x.py build -DENABLE_OPENSSL=ON 2>&1 | tail -3
-    mkdir -p "$KVROCKS_DIR/bin"
-    cp build/kvrocks "$KVROCKS_DIR/bin/"
-    cd /
-    rm -rf "$TMP"
-    ok "KVRocks built and installed at $KVROCKS_BIN"
+        cmake g++ autoconf automake libtool \
+        libsnappy-dev libgflags-dev libzstd-dev libbz2-dev liblz4-dev \
+        2>/dev/null || true
+    ok "KVRocks build deps ready — AIL\'s installing_deps.sh will handle the compile"
 }
 
 # =============================================================================
@@ -539,7 +575,7 @@ setup_lacus() {
     fi
 
     source "$LACUS_VENV/bin/activate"
-    "$LACUS_VENV/bin/pip" install --upgrade pip -q
+    "$LACUS_VENV/bin/pip" install --upgrade pip setuptools wheel -q
     if [[ -f "$LACUS_DIR/requirements.txt" ]]; then
         "$LACUS_VENV/bin/pip" install -r "$LACUS_DIR/requirements.txt" -q
     else
@@ -634,7 +670,7 @@ setup_libretranslate() {
         mkdir -p /opt/libretranslate
         $PYTHON_BIN -m venv "$LT_VENV"
         # Use the venv's own pip binary directly — avoids any PEP 668 issues
-        "$LT_VENV/bin/pip" install --upgrade pip -q
+        "$LT_VENV/bin/pip" install --upgrade pip setuptools wheel -q
         "$LT_VENV/bin/pip" install libretranslate -q
         ok "LibreTranslate installed"
     fi
